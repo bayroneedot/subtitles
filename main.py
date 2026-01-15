@@ -3,25 +3,30 @@ import uuid
 import subprocess
 import requests
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 
-# ================= CONFIG =================
 API_KEY = os.getenv("API_KEY", "changeme")
-TMP_DIR = "/tmp"
-MAX_VIDEO_SECONDS = 180  # 3 minutes
+TMP = "/tmp"
 FONT_DIR = "/app/fonts"
+MAX_SECONDS = 180
 
-# =========================================
+PRESETS = {
+    "top": 8,
+    "middle": 5,
+    "bottom": 2
+}
 
-app = FastAPI(title="Subtitle Burner API")
+app = FastAPI(title="Timed Subtitle Burner API")
 
 # ---------- Models ----------
 class SubtitleTrack(BaseModel):
-    srt: str
-    position: dict  # { "x": "50%", "y": "85%" }
-    color: str      # hex "#FFFFFF"
-    size: int
+    srt: str                 # FULL SRT WITH TIMESTAMPS
+    color: str = "#FFFFFF"
+    size: Optional[int] = None
+    font: str = "Inter-Bold.ttf"
+    preset: Optional[str] = "bottom"
 
 class BurnRequest(BaseModel):
     video_url: str
@@ -29,35 +34,36 @@ class BurnRequest(BaseModel):
     subtitle_2: Optional[SubtitleTrack] = None
 
 # ---------- Utils ----------
-def check_api_key(key: str):
+def auth(key: str):
     if key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(401, "Invalid API key")
 
 def run(cmd):
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode())
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.decode())
 
-def write_ass(track: SubtitleTrack, filename: str):
-    x = track.position.get("x", "50%")
-    y = track.position.get("y", "90%")
+def auto_font_size():
+    return 48  # TikTok-safe default
 
-    def pct(v): return int(float(v.replace("%","")))
+def write_srt(content: str, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content.strip())
 
-    ass = f"""
-[Script Info]
-ScriptType: v4.00+
+def style(track: SubtitleTrack):
+    align = PRESETS.get(track.preset, 2)
+    size = track.size or auto_font_size()
+    color = track.color.lstrip("#")
+    bgr = color[4:6] + color[2:4] + color[0:2]
 
-[V4+ Styles]
-Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Outline,Shadow,Alignment,MarginL,MarginR,MarginV
-Style: Default,Inter,{track.size},&H{track.color[5:7]}{track.color[3:5]}{track.color[1:3]},&H00000000,&H80000000,0,2,2,2,10,10,10
-
-[Events]
-Format: Layer,Start,End,Style,Text
-Dialogue: 0,0:00:00.00,9:59:59.99,Default,{{\\pos({pct(x)},{pct(y)})}}{track.srt.replace(chr(10), '\\N')}
-"""
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(ass)
+    return (
+        f"FontName={track.font.replace('.ttf','')},"
+        f"FontSize={size},"
+        f"PrimaryColour=&H{bgr}&,"
+        f"Outline=2,"
+        f"Shadow=2,"
+        f"Alignment={align}"
+    )
 
 # ---------- Routes ----------
 @app.get("/ping")
@@ -66,40 +72,41 @@ def ping():
 
 @app.post("/burn-subtitles")
 def burn(req: BurnRequest, x_api_key: str = Header(...)):
-    check_api_key(x_api_key)
+    auth(x_api_key)
 
-    job_id = str(uuid.uuid4())
-    video_path = f"{TMP_DIR}/{job_id}.mp4"
-    out_path = f"{TMP_DIR}/{job_id}_out.mp4"
+    uid = str(uuid.uuid4())
+    video = f"{TMP}/{uid}.mp4"
+    out = f"{TMP}/{uid}_out.mp4"
 
-    # download video
     r = requests.get(req.video_url, stream=True)
     if r.status_code != 200:
-        raise HTTPException(400, "Failed to download video")
+        raise HTTPException(400, "Video download failed")
 
-    with open(video_path, "wb") as f:
-        for chunk in r.iter_content(1024 * 1024):
-            f.write(chunk)
+    with open(video, "wb") as f:
+        for c in r.iter_content(1024 * 1024):
+            f.write(c)
 
-    # subtitle files
-    ass_files = []
-    ass1 = f"{TMP_DIR}/{job_id}_1.ass"
-    write_ass(req.subtitle_1, ass1)
-    ass_files.append(ass1)
+    filters = []
+
+    srt1 = f"{TMP}/{uid}_1.srt"
+    write_srt(req.subtitle_1.srt, srt1)
+    filters.append(
+        f"subtitles={srt1}:fontsdir={FONT_DIR}:force_style='{style(req.subtitle_1)}'"
+    )
 
     if req.subtitle_2:
-        ass2 = f"{TMP_DIR}/{job_id}_2.ass"
-        write_ass(req.subtitle_2, ass2)
-        ass_files.append(ass2)
-
-    filters = ",".join([f"ass={a}" for a in ass_files])
+        srt2 = f"{TMP}/{uid}_2.srt"
+        write_srt(req.subtitle_2.srt, srt2)
+        filters.append(
+            f"subtitles={srt2}:fontsdir={FONT_DIR}:force_style='{style(req.subtitle_2)}'"
+        )
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", video_path,
-        "-vf", filters,
+        "-i", video,
+        "-vf", ",".join(filters),
         "-c:a", "copy",
-        out_path
+        out
     ]
 
     try:
@@ -107,18 +114,11 @@ def burn(req: BurnRequest, x_api_key: str = Header(...)):
     except Exception as e:
         raise HTTPException(500, str(e))
 
-    return {
-        "download_url": f"/download/{job_id}"
-    }
+    return {"download_url": f"/download/{uid}"}
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
-    path = f"{TMP_DIR}/{job_id}_out.mp4"
+    path = f"{TMP}/{job_id}_out.mp4"
     if not os.path.exists(path):
-        raise HTTPException(404, "File not found")
-
-    return fastapi.responses.FileResponse(
-        path,
-        media_type="video/mp4",
-        filename="final.mp4"
-    )
+        raise HTTPException(404, "Not found")
+    return FileResponse(path, media_type="video/mp4", filename="final.mp4")

@@ -22,7 +22,7 @@ app = FastAPI(title="Timed Subtitle Burner API")
 
 # ---------- Models ----------
 class SubtitleTrack(BaseModel):
-    srt: str                 # FULL SRT WITH TIMESTAMPS
+    srt: str                 # Full SRT with timestamps
     color: str = "#FFFFFF"
     size: Optional[int] = None
     font: str = "Inter-Bold.ttf"
@@ -47,15 +47,19 @@ def auto_font_size():
     return 48  # TikTok-safe default
 
 def write_srt(content: str, path: str):
+    """Ensure UTF-8, LF endings"""
+    srt_text = content.strip().replace('\r\n', '\n').replace('\r', '\n')
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content.strip())
+        f.write(srt_text)
 
 def style(track: SubtitleTrack):
     align = PRESETS.get(track.preset, 2)
     size = track.size or auto_font_size()
     color = track.color.lstrip("#")
+    # Convert #RRGGBB to BGR hex for FFmpeg libass
+    if len(color) != 6:
+        color = "FFFFFF"
     bgr = color[4:6] + color[2:4] + color[0:2]
-
     return (
         f"FontName={track.font.replace('.ttf','')},"
         f"FontSize={size},"
@@ -78,27 +82,35 @@ def burn(req: BurnRequest, x_api_key: str = Header(...)):
     video = f"{TMP}/{uid}.mp4"
     out = f"{TMP}/{uid}_out.mp4"
 
-    r = requests.get(req.video_url, stream=True)
-    if r.status_code != 200:
-        raise HTTPException(400, "Video download failed")
+    # --- Download video ---
+    try:
+        r = requests.get(req.video_url, stream=True)
+        if r.status_code != 200:
+            raise HTTPException(400, "Video download failed")
+        with open(video, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                f.write(chunk)
+    except Exception as e:
+        raise HTTPException(400, f"Video download error: {e}")
 
-    with open(video, "wb") as f:
-        for c in r.iter_content(1024 * 1024):
-            f.write(c)
-
+    # --- Build FFmpeg filters ---
     filters = []
 
+    # Subtitle 1
     srt1 = f"{TMP}/{uid}_1.srt"
     write_srt(req.subtitle_1.srt, srt1)
+    print("Subtitle 1 path:", srt1)
     filters.append(
-        f"subtitles={srt1}:fontsdir={FONT_DIR}:force_style='{style(req.subtitle_1)}'"
+        f"subtitles='{srt1}':fontsdir={FONT_DIR}:force_style='{style(req.subtitle_1)}'"
     )
 
+    # Subtitle 2 (optional)
     if req.subtitle_2:
         srt2 = f"{TMP}/{uid}_2.srt"
         write_srt(req.subtitle_2.srt, srt2)
+        print("Subtitle 2 path:", srt2)
         filters.append(
-            f"subtitles={srt2}:fontsdir={FONT_DIR}:force_style='{style(req.subtitle_2)}'"
+            f"subtitles='{srt2}':fontsdir={FONT_DIR}:force_style='{style(req.subtitle_2)}'"
         )
 
     cmd = [
@@ -109,10 +121,12 @@ def burn(req: BurnRequest, x_api_key: str = Header(...)):
         out
     ]
 
+    print("Running FFmpeg command:", " ".join(cmd))
+
     try:
         run(cmd)
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"FFmpeg error: {e}")
 
     return {"download_url": f"/download/{uid}"}
 
